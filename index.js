@@ -186,9 +186,19 @@ app.post("/slack/events", async (req, res) => {
 
   const event = body.event;
   if (!event) return;
-  if (event.type !== "app_mention" && event.type !== "message") return;
+
+  // Ignore bot messages and subtypes (joins, leaves etc)
   if (event.bot_id || event.subtype) return;
 
+  // For app_mention in main channel - start a thread
+  // For message in a thread - respond in that thread
+  // Ignore regular channel messages that are NOT in a thread and NOT a mention
+  const isAppMention = event.type === "app_mention";
+  const isThreadReply = event.type === "message" && event.thread_ts && event.thread_ts !== event.ts;
+
+  if (!isAppMention && !isThreadReply) return;
+
+  // Deduplicate events
   const eventId = body.event_id;
   if (processedEvents.has(eventId)) return;
   processedEvents.add(eventId);
