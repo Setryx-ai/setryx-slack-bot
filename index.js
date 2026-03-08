@@ -6,7 +6,7 @@ app.use(express.json());
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
 
-const VOICE_ROLEPLAY_URL = "https://voice-prospect-trainer--nburns1994.replit.app";
+const VOICE_ROLEPLAY_URL = "https://setryx-voice.up.railway.app";
 
 const threadHistory = {};
 const processedEvents = new Set();
@@ -77,8 +77,8 @@ MODE 2 — REVIEW AND ANALYSIS MODE
 When a rep pastes a transcript, call notes, or setter notes:
 
 PRIMARY RULE (NON-NEGOTIABLE):
-If the user sends a transcript or call notes AND does NOT explicitly state "Deal Review", "Airtable Note", or "Performance Review", respond ONLY with:
-"Got it. Do you want a Deal Review, an Airtable Note for the closer, or a Performance Review?"
+If the user sends a transcript or call notes AND does NOT explicitly state "Deal Review", "Closer Brief", or "Performance Review", respond ONLY with:
+"Got it. Do you want a Deal Review, a Closer Brief for the closer, or a Performance Review?"
 
 MULTI-PART TRANSCRIPT RULE (NON-NEGOTIABLE):
 If the user indicates they are sending a transcript in multiple parts (e.g. "part 1", "first half", "more coming", "don't respond yet"), respond ONLY with:
@@ -87,7 +87,7 @@ Wait until the user says "done", "that's all", or "full transcript sent" — the
 
 If the user explicitly states:
 - "Deal Review" -> generate Deal Review immediately.
-- "Airtable Note" -> generate Airtable Note immediately.
+- "Closer Brief" -> generate Closer Brief immediately.
 - "Performance Review" -> generate Performance Review immediately.
 
 LANGUAGE RULE: Always respond in English regardless of transcript language.
@@ -106,7 +106,7 @@ FINANCIAL LOGIC:
 
 ---
 
-OUTPUT TYPE 1 — AIRTABLE NOTE:
+OUTPUT TYPE 1 — CLOSER BRIEF:
 - Budget
 - Intent (Low/Medium/High + short justification)
 - Current Situation
@@ -304,17 +304,17 @@ app.post("/slack/events", async (req, res) => {
 
   if (!userMessage) return;
 
-  // ── Roleplay trigger — send link instead of calling Claude ──
+  // ── Roleplay trigger ──
   if (isRoleplayRequest(userMessage)) {
     await postToSlack(
       channel,
-      `🎙 *Voice Roleplay Mode*\n\nOpen the link below to run a live call simulation with SetryX AI. Speak naturally — SetryX plays the prospect. When you end the call you'll get a full Performance Review.\n\n👉 ${VOICE_ROLEPLAY_URL}\n\n_Allow microphone access when prompted. Best in Chrome._`,
+      `🎙 *Voice Roleplay Mode*\n\nOpen the link below to run a live call simulation with SetryX AI. Speak naturally — SetryX plays the prospect. When you end the call you'll get a full 19-metric Performance Review posted here in Slack.\n\n👉 ${VOICE_ROLEPLAY_URL}\n\n_Allow microphone access when prompted. Best used in Chrome._`,
       threadTs
     );
     return;
   }
 
-  // ── Normal flow — send to Claude ──
+  // ── Normal flow ──
   if (!threadHistory[threadTs]) {
     threadHistory[threadTs] = [];
   }
@@ -322,9 +322,7 @@ app.post("/slack/events", async (req, res) => {
   threadHistory[threadTs].push({ role: "user", content: userMessage });
 
   try {
-    console.log("Calling Claude with message:", userMessage.substring(0, 50));
     const reply = await callClaude(threadHistory[threadTs]);
-    console.log("Got reply from Claude, length:", reply.length);
     threadHistory[threadTs].push({ role: "assistant", content: reply });
 
     if (threadHistory[threadTs].length > 20) {
