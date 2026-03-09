@@ -212,23 +212,46 @@ function fetchAircallTranscript(callId) {
       res.on("end", () => {
         try {
           const parsed = JSON.parse(data);
+          console.log("Aircall raw response keys:", JSON.stringify(Object.keys(parsed)));
           const call = parsed.call;
-          if (!call) return reject(new Error("Call not found"));
+          if (!call) return reject(new Error("Call not found in Aircall response"));
 
-          // Try to get transcript from transcription object
+          console.log("Call keys:", JSON.stringify(Object.keys(call)));
+          console.log("transcription field:", JSON.stringify(call.transcription)?.substring(0, 300));
+
+          // Extract transcript — try all known field structures
           let transcript = null;
-          if (call.transcription && call.transcription.content) {
-            transcript = call.transcription.content;
+
+          if (call.transcription) {
+            const t = call.transcription;
+            console.log("transcription keys:", JSON.stringify(Object.keys(t)));
+            if (t.content) transcript = t.content;
+            else if (t.full_transcript) transcript = t.full_transcript;
+            else if (t.text) transcript = t.text;
+            else if (Array.isArray(t.sentences)) {
+              transcript = t.sentences.map(s => `${s.speaker || ''}: ${s.text || s.content || ''}`).join("\n");
+            } else if (Array.isArray(t)) {
+              transcript = t.map(s => `${s.speaker || ''}: ${s.text || s.content || ''}`).join("\n");
+            } else {
+              // Dump whatever we have
+              transcript = JSON.stringify(t);
+            }
           } else if (call.transcript) {
-            transcript = call.transcript;
+            transcript = typeof call.transcript === "string" ? call.transcript : JSON.stringify(call.transcript);
           }
 
-          if (!transcript) return reject(new Error("No transcript found for this call. Make sure AI transcription is enabled and the call has been processed."));
+          if (!transcript) {
+            return reject(new Error(`No transcript found. Call keys available: ${Object.keys(call).join(", ")}`));
+          }
 
-          const duration = call.duration ? `${Math.floor(call.duration / 60)}:${String(call.duration % 60).padStart(2, "0")}` : "Unknown";
+          const duration = call.duration
+            ? `${Math.floor(call.duration / 60)}:${String(call.duration % 60).padStart(2, "0")}`
+            : "Unknown";
+
           resolve({ transcript, duration, callId });
         } catch (e) {
-          reject(new Error("Failed to parse Aircall response"));
+          console.error("Parse error:", e.message, "Raw:", data.substring(0, 500));
+          reject(new Error("Failed to parse Aircall response: " + e.message));
         }
       });
     });
@@ -240,10 +263,7 @@ function fetchAircallTranscript(callId) {
 
 // ── Extract Aircall call ID from URL ──
 function extractAircallCallId(text) {
-  // Match patterns like:
-  // https://dashboard.aircall.io/calls/12345678
-  // https://app.aircall.io/calls/12345678
-  const match = text.match(/aircall\.io\/(?:calls|call)\/(\d+)/i);
+  const match = text.match(/aircall\.io\/calls\/(\d+)/i);
   return match ? match[1] : null;
 }
 
@@ -275,7 +295,6 @@ function callClaude(messages) {
         try {
           const parsed = JSON.parse(data);
           if (parsed.error) {
-            console.error("Anthropic error:", parsed.error);
             reject(new Error(parsed.error.message));
           } else {
             resolve(parsed.content?.[0]?.text || "No response.");
@@ -378,8 +397,6 @@ app.post("/slack/events", async (req, res) => {
     try {
       const { transcript, duration } = await fetchAircallTranscript(aircallCallId);
       await postToSlack(channel, `✅ Got it — call duration: *${duration}*. Do you want a Deal Review, a Closer Brief for the closer, or a Performance Review?`, threadTs);
-
-      // Store transcript in thread history for next message
       if (!threadHistory[threadTs]) threadHistory[threadTs] = [];
       threadHistory[threadTs].push({
         role: "user",
@@ -393,20 +410,15 @@ app.post("/slack/events", async (req, res) => {
   }
 
   // ── Normal flow ──
-  if (!threadHistory[threadTs]) {
-    threadHistory[threadTs] = [];
-  }
-
+  if (!threadHistory[threadTs]) threadHistory[threadTs] = [];
   threadHistory[threadTs].push({ role: "user", content: userMessage });
 
   try {
     const reply = await callClaude(threadHistory[threadTs]);
     threadHistory[threadTs].push({ role: "assistant", content: reply });
-
     if (threadHistory[threadTs].length > 20) {
       threadHistory[threadTs] = threadHistory[threadTs].slice(-20);
     }
-
     await postToSlack(channel, reply, threadTs);
   } catch (err) {
     console.error("Error:", err.message);
