@@ -1,5 +1,6 @@
 const express = require("express");
 const https = require("https");
+const { Pool } = require("pg");
 const app = express();
 app.use(express.json());
 
@@ -7,12 +8,369 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
 const AIRCALL_API_ID = process.env.AIRCALL_API_ID;
 const AIRCALL_API_TOKEN = process.env.AIRCALL_API_TOKEN;
+const DATABASE_URL = process.env.DATABASE_URL;
 
 const VOICE_ROLEPLAY_URL = "https://setryx-voice.up.railway.app";
+
+const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
 
 const threadHistory = {};
 const processedEvents = new Set();
 
+// ── Database setup ──
+async function setupDatabase() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS reviews (
+      id SERIAL PRIMARY KEY,
+      rep_name TEXT,
+      channel TEXT,
+      review_type TEXT,
+      call_score NUMERIC,
+      call_duration TEXT,
+      overall_verdict TEXT,
+      raw_review TEXT,
+      metric_framework_flow INT,
+      metric_intro_energy INT,
+      metric_intent_discovery INT,
+      metric_qualification INT,
+      metric_value_bridge INT,
+      metric_belief_calibration INT,
+      metric_listening INT,
+      metric_emotion_logic INT,
+      metric_call_control INT,
+      metric_internal_external INT,
+      metric_objection_prevention INT,
+      metric_energy_management INT,
+      metric_question_quality INT,
+      metric_nonbuyer_recognition INT,
+      metric_closer_positioning INT,
+      metric_tonality INT,
+      metric_booking_mechanics INT,
+      metric_duration_management INT,
+      metric_value_focus INT,
+      top_weaknesses TEXT[],
+      close_probability TEXT,
+      red_flags TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+  console.log("Database ready");
+}
+
+// ── Extract data from a Performance Review ──
+function parsePerformanceReview(text, repName) {
+  const data = { rep_name: repName, review_type: "performance", raw_review: text };
+
+  // Extract overall score
+  const scoreMatch = text.match(/OVERALL CALL SCORE:\s*(\d+(?:\.\d+)?)\s*\/\s*10/i);
+  if (scoreMatch) data.call_score = parseFloat(scoreMatch[1]);
+
+  // Extract verdict (line after overall score)
+  const verdictMatch = text.match(/OVERALL CALL SCORE:.*\n([^\n=]+)/i);
+  if (verdictMatch) data.overall_verdict = verdictMatch[1].trim();
+
+  // Extract 19 metrics
+  const metricMap = {
+    "Framework Flow": "metric_framework_flow",
+    "Introduction Energy": "metric_intro_energy",
+    "Intent Discovery": "metric_intent_discovery",
+    "Qualification Precision": "metric_qualification",
+    "Value Bridge Creation": "metric_value_bridge",
+    "Belief Calibration": "metric_belief_calibration",
+    "Listening Attentiveness": "metric_listening",
+    "Emotion/Logic Balance": "metric_emotion_logic",
+    "Call Control": "metric_call_control",
+    "Internal vs External Focus": "metric_internal_external",
+    "Objection Prevention": "metric_objection_prevention",
+    "Energy Management": "metric_energy_management",
+    "Question Quality": "metric_question_quality",
+    "Non-Buyer Recognition": "metric_nonbuyer_recognition",
+    "Closer Positioning": "metric_closer_positioning",
+    "Tonality Control": "metric_tonality",
+    "Booking Mechanics": "metric_booking_mechanics",
+    "Call Duration Management": "metric_duration_management",
+    "Value Focus": "metric_value_focus",
+  };
+
+  for (const [name, col] of Object.entries(metricMap)) {
+    const re = new RegExp(name.replace("/", "\\/") + ".*?(\\d)\\s*\\/\\s*5", "i");
+    const m = text.match(re);
+    if (m) data[col] = parseInt(m[1]);
+  }
+
+  // Extract top weaknesses (metrics scored 1 or 2)
+  const weaknesses = [];
+  for (const [name, col] of Object.entries(metricMap)) {
+    if (data[col] && data[col] <= 2) weaknesses.push(name);
+  }
+  data.top_weaknesses = weaknesses;
+
+  return data;
+}
+
+function parseDealReview(text, repName) {
+  const data = { rep_name: repName, review_type: "deal", raw_review: text };
+
+  const scoreMatch = text.match(/OVERALL CALL SCORE:\s*(\d+(?:\.\d+)?)\s*\/\s*10/i);
+  if (scoreMatch) data.call_score = parseFloat(scoreMatch[1]);
+
+  const verdictMatch = text.match(/OVERALL CALL SCORE:.*\n([^\n=]+)/i);
+  if (verdictMatch) data.overall_verdict = verdictMatch[1].trim();
+
+  const probMatch = text.match(/Close Probability:\s*(Low|Medium|High)/i);
+  if (probMatch) data.close_probability = probMatch[1];
+
+  const redFlagMatch = text.match(/Red Flags?:([\s\S]*?)(?=\n[A-Z]|\n==|$)/i);
+  if (redFlagMatch) data.red_flags = redFlagMatch[1].trim();
+
+  return data;
+}
+
+async function saveReview(data) {
+  try {
+    const cols = Object.keys(data).filter(k => data[k] !== undefined && data[k] !== null);
+    const vals = cols.map(k => Array.isArray(data[k]) ? data[k] : data[k]);
+    const placeholders = cols.map((_, i) => `$${i + 1}`).join(", ");
+    await pool.query(
+      `INSERT INTO reviews (${cols.join(", ")}) VALUES (${placeholders})`,
+      vals
+    );
+    console.log("Review saved to database");
+  } catch (err) {
+    console.error("Failed to save review:", err.message);
+  }
+}
+
+// ── Manager analytics ──
+const MANAGER_SYSTEM_PROMPT = `You are SetryX AI in Manager Mode. You have access to aggregated performance data from the team's calls. When given data, you analyse it and respond as a sharp, direct coaching intelligence. You identify patterns, name specific reps when relevant, and give actionable insight. Never waffle. Never be generic. Speak like a performance director who has seen every number and knows what it means.
+
+When asked to create a coaching agenda or presentation outline, structure it clearly with sections, key points, and specific rep callouts where relevant. Format it so a manager could walk into a team meeting and run it directly.`;
+
+async function getTeamAnalytics(days = 30) {
+  const result = await pool.query(`
+    SELECT 
+      rep_name,
+      COUNT(*) as total_calls,
+      ROUND(AVG(call_score), 1) as avg_score,
+      ROUND(AVG(metric_framework_flow), 1) as avg_framework,
+      ROUND(AVG(metric_intro_energy), 1) as avg_intro,
+      ROUND(AVG(metric_intent_discovery), 1) as avg_intent,
+      ROUND(AVG(metric_qualification), 1) as avg_qualification,
+      ROUND(AVG(metric_value_bridge), 1) as avg_value_bridge,
+      ROUND(AVG(metric_belief_calibration), 1) as avg_belief,
+      ROUND(AVG(metric_listening), 1) as avg_listening,
+      ROUND(AVG(metric_call_control), 1) as avg_call_control,
+      ROUND(AVG(metric_objection_prevention), 1) as avg_objection,
+      ROUND(AVG(metric_booking_mechanics), 1) as avg_booking,
+      ROUND(AVG(metric_question_quality), 1) as avg_questions,
+      ROUND(AVG(metric_tonality), 1) as avg_tonality,
+      ROUND(AVG(metric_energy_management), 1) as avg_energy,
+      ROUND(AVG(metric_closer_positioning), 1) as avg_closer_positioning
+    FROM reviews
+    WHERE created_at > NOW() - INTERVAL '${days} days'
+    AND review_type = 'performance'
+    GROUP BY rep_name
+    ORDER BY avg_score DESC
+  `);
+  return result.rows;
+}
+
+async function getWeaknesses(days = 30) {
+  const result = await pool.query(`
+    SELECT 
+      unnest(top_weaknesses) as weakness,
+      COUNT(*) as frequency
+    FROM reviews
+    WHERE created_at > NOW() - INTERVAL '${days} days'
+    AND review_type = 'performance'
+    GROUP BY weakness
+    ORDER BY frequency DESC
+    LIMIT 10
+  `);
+  return result.rows;
+}
+
+async function getRepTrend(repName, limit = 10) {
+  const result = await pool.query(`
+    SELECT call_score, call_duration, overall_verdict, created_at
+    FROM reviews
+    WHERE LOWER(rep_name) LIKE LOWER($1)
+    AND review_type = 'performance'
+    ORDER BY created_at DESC
+    LIMIT $2
+  `, [`%${repName}%`, limit]);
+  return result.rows;
+}
+
+async function handleManagerQuery(userMessage, channel, threadTs) {
+  const lower = userMessage.toLowerCase();
+
+  let analyticsData = "";
+
+  // Detect what they're asking for
+  const dayMatch = lower.match(/(\d+)\s*days?/);
+  const days = dayMatch ? parseInt(dayMatch[1]) : 30;
+
+  // Rep trend query
+  const trendMatch = lower.match(/how is ([a-z]+)\s*(doing|trending|performing)/i) ||
+                     lower.match(/([a-z]+)'s (trend|progress|performance)/i);
+
+  if (trendMatch) {
+    const repName = trendMatch[1];
+    const trend = await getRepTrend(repName);
+    if (trend.length === 0) {
+      await postToSlack(channel, `No reviews found for "${repName}" in the database yet.`, threadTs);
+      return true;
+    }
+    analyticsData = `Rep trend for ${repName} (last ${trend.length} calls):\n` +
+      trend.map((r, i) => `Call ${i+1}: Score ${r.call_score}/10 — ${r.overall_verdict} (${new Date(r.created_at).toLocaleDateString()})`).join("\n");
+  } else {
+    // Team-wide query
+    const [teamData, weaknesses] = await Promise.all([
+      getTeamAnalytics(days),
+      getWeaknesses(days)
+    ]);
+
+    if (teamData.length === 0) {
+      await postToSlack(channel, `No performance reviews in the database yet. Reviews will be stored automatically once the team starts submitting calls.`, threadTs);
+      return true;
+    }
+
+    analyticsData = `TEAM PERFORMANCE DATA — Last ${days} days\n\n`;
+    analyticsData += `INDIVIDUAL REP SCORES:\n`;
+    teamData.forEach(rep => {
+      analyticsData += `${rep.rep_name}: ${rep.avg_score}/10 avg (${rep.total_calls} calls reviewed)\n`;
+      analyticsData += `  Key metrics: Framework ${rep.avg_framework}/5 | Qualification ${rep.avg_qualification}/5 | Booking ${rep.avg_booking}/5 | Questions ${rep.avg_questions}/5 | Objection Prevention ${rep.avg_objection}/5\n`;
+    });
+
+    analyticsData += `\nTEAM WEAKNESSES (by frequency):\n`;
+    weaknesses.forEach(w => {
+      analyticsData += `${w.weakness}: flagged ${w.frequency} times\n`;
+    });
+  }
+
+  // Send to Claude with manager prompt
+  const reply = await callClaudeWithSystem(MANAGER_SYSTEM_PROMPT, [
+    { role: "user", content: `${analyticsData}\n\nManager question: ${userMessage}` }
+  ]);
+
+  await postToSlack(channel, reply, threadTs);
+  return true;
+}
+
+function isManagerQuery(message) {
+  const lower = message.toLowerCase();
+  return (
+    lower.includes("team") ||
+    lower.includes("reps") ||
+    lower.includes("struggling") ||
+    lower.includes("weakness") ||
+    lower.includes("weaknesses") ||
+    lower.includes("trending") ||
+    lower.includes("trend") ||
+    lower.includes("coaching agenda") ||
+    lower.includes("coaching deck") ||
+    lower.includes("presentation") ||
+    lower.includes("how is ") ||
+    lower.includes("who is") ||
+    lower.includes("analytics") ||
+    lower.includes("stats") ||
+    lower.includes("performance data") ||
+    lower.includes("last 30") ||
+    lower.includes("last 7") ||
+    lower.includes("this month") ||
+    lower.includes("leaderboard") ||
+    lower.includes("top performer") ||
+    lower.includes("bottom") ||
+    lower.includes("improving") ||
+    lower.includes("declining")
+  );
+}
+
+// ── Aircall API ──
+function fetchAircallTranscript(callId) {
+  return new Promise((resolve, reject) => {
+    const auth = Buffer.from(`${AIRCALL_API_ID}:${AIRCALL_API_TOKEN}`).toString("base64");
+
+    const getDuration = () => new Promise((res2) => {
+      const opts = {
+        hostname: "api.aircall.io",
+        path: `/v1/calls/${callId}`,
+        method: "GET",
+        headers: { "Authorization": `Basic ${auth}`, "Content-Type": "application/json" },
+      };
+      const r = https.request(opts, (response) => {
+        let d = "";
+        response.on("data", c => d += c);
+        response.on("end", () => {
+          try {
+            const p = JSON.parse(d);
+            const dur = p.call?.duration;
+            res2(dur ? `${Math.floor(dur/60)}:${String(dur%60).padStart(2,"0")}` : "Unknown");
+          } catch { res2("Unknown"); }
+        });
+      });
+      r.on("error", () => res2("Unknown"));
+      r.end();
+    });
+
+    const options = {
+      hostname: "api.aircall.io",
+      path: `/v1/calls/${callId}/transcription`,
+      method: "GET",
+      headers: { "Authorization": `Basic ${auth}`, "Content-Type": "application/json" },
+    };
+
+    const req = https.request(options, (res) => {
+      let data = "";
+      res.on("data", (chunk) => { data += chunk; });
+      res.on("end", async () => {
+        try {
+          console.log("Transcription raw:", data.substring(0, 500));
+          const parsed = JSON.parse(data);
+          let transcript = null;
+
+          if (parsed.transcription) {
+            const t = parsed.transcription;
+            if (typeof t === "string") transcript = t;
+            else if (t.content) transcript = t.content;
+            else if (t.text) transcript = t.text;
+            else if (Array.isArray(t.sentences)) {
+              transcript = t.sentences.map(s => `${s.channel || s.speaker || ""}: ${s.text || s.content || ""}`).join("\n");
+            } else if (Array.isArray(t)) {
+              transcript = t.map(s => `${s.channel || s.speaker || ""}: ${s.text || s.content || ""}`).join("\n");
+            }
+          } else if (parsed.sentences) {
+            transcript = parsed.sentences.map(s => `${s.channel || s.speaker || ""}: ${s.text || s.content || ""}`).join("\n");
+          } else if (parsed.content) {
+            transcript = parsed.content;
+          } else if (parsed.text) {
+            transcript = parsed.text;
+          }
+
+          if (!transcript) {
+            return reject(new Error("Transcript not available. The call may still be processing — try again in a few minutes, or make sure AI Assist is enabled on this number in Aircall."));
+          }
+
+          const duration = await getDuration();
+          resolve({ transcript, duration, callId });
+        } catch (e) {
+          reject(new Error("Failed to parse transcript: " + e.message));
+        }
+      });
+    });
+
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+function extractAircallCallId(text) {
+  const match = text.match(/aircall\.io\/calls\/(\d+)/i);
+  return match ? match[1] : null;
+}
+
+// ── Claude API ──
 const SYSTEM_PROMPT = `You are SetryX AI — the internal coaching intelligence for a coaching business. You operate in two distinct modes depending on what the rep sends you.
 
 ══════════════════════════════════════
@@ -192,103 +550,17 @@ NEVER end any output without the Overall Call Score block.
 BEHAVIOR ENFORCEMENT:
 Never generate generic summaries. Only the clarification question or the exact requested format. No fluff. No invented details.`;
 
-// ── Aircall API ──
-function fetchAircallTranscript(callId) {
-  return new Promise((resolve, reject) => {
-    const auth = Buffer.from(`${AIRCALL_API_ID}:${AIRCALL_API_TOKEN}`).toString("base64");
-
-    // Step 1: get call duration from standard API
-    const getDuration = () => new Promise((res2) => {
-      const opts = {
-        hostname: "api.aircall.io",
-        path: `/v1/calls/${callId}`,
-        method: "GET",
-        headers: { "Authorization": `Basic ${auth}`, "Content-Type": "application/json" },
-      };
-      const r = https.request(opts, (response) => {
-        let d = "";
-        response.on("data", c => d += c);
-        response.on("end", () => {
-          try {
-            const p = JSON.parse(d);
-            const dur = p.call?.duration;
-            res2(dur ? `${Math.floor(dur/60)}:${String(dur%60).padStart(2,"0")}` : "Unknown");
-          } catch { res2("Unknown"); }
-        });
-      });
-      r.on("error", () => res2("Unknown"));
-      r.end();
-    });
-
-    // Step 2: get transcript from Conversation Intelligence endpoint
-    const options = {
-      hostname: "api.aircall.io",
-      path: `/v1/calls/${callId}/transcription`,
-      method: "GET",
-      headers: {
-        "Authorization": `Basic ${auth}`,
-        "Content-Type": "application/json",
-      },
-    };
-
-    const req = https.request(options, (res) => {
-      let data = "";
-      res.on("data", (chunk) => { data += chunk; });
-      res.on("end", async () => {
-        try {
-          console.log("Transcription raw:", data.substring(0, 500));
-          const parsed = JSON.parse(data);
-          let transcript = null;
-
-          if (parsed.transcription) {
-            const t = parsed.transcription;
-            if (typeof t === "string") transcript = t;
-            else if (t.content) transcript = t.content;
-            else if (t.text) transcript = t.text;
-            else if (Array.isArray(t.sentences)) {
-              transcript = t.sentences.map(s => `${s.channel || s.speaker || ""}: ${s.text || s.content || ""}`).join("\n");
-            } else if (Array.isArray(t)) {
-              transcript = t.map(s => `${s.channel || s.speaker || ""}: ${s.text || s.content || ""}`).join("\n");
-            }
-          } else if (parsed.sentences) {
-            transcript = parsed.sentences.map(s => `${s.channel || s.speaker || ""}: ${s.text || s.content || ""}`).join("\n");
-          } else if (parsed.content) {
-            transcript = parsed.content;
-          } else if (parsed.text) {
-            transcript = parsed.text;
-          }
-
-          if (!transcript) {
-            return reject(new Error("Transcript not available. The call may still be processing — try again in a few minutes, or make sure AI Assist is enabled on this number in Aircall."));
-          }
-
-          const duration = await getDuration();
-          resolve({ transcript, duration, callId });
-        } catch (e) {
-          console.error("Parse error:", e.message, "Raw:", data.substring(0, 500));
-          reject(new Error("Failed to parse transcript: " + e.message));
-        }
-      });
-    });
-
-    req.on("error", reject);
-    req.end();
-  });
-}
-
-// ── Extract Aircall call ID from URL ──
-function extractAircallCallId(text) {
-  const match = text.match(/aircall\.io\/calls\/(\d+)/i);
-  return match ? match[1] : null;
-}
-
 function callClaude(messages) {
+  return callClaudeWithSystem(SYSTEM_PROMPT, messages);
+}
+
+function callClaudeWithSystem(systemPrompt, messages) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({
       model: "claude-sonnet-4-20250514",
       max_tokens: 4000,
-      system: SYSTEM_PROMPT,
-      messages: messages,
+      system: systemPrompt,
+      messages,
     });
 
     const options = {
@@ -309,14 +581,9 @@ function callClaude(messages) {
       res.on("end", () => {
         try {
           const parsed = JSON.parse(data);
-          if (parsed.error) {
-            reject(new Error(parsed.error.message));
-          } else {
-            resolve(parsed.content?.[0]?.text || "No response.");
-          }
-        } catch (e) {
-          reject(e);
-        }
+          if (parsed.error) reject(new Error(parsed.error.message));
+          else resolve(parsed.content?.[0]?.text || "No response.");
+        } catch (e) { reject(e); }
       });
     });
 
@@ -339,13 +606,11 @@ function postToSlack(channel, text, threadTs) {
         "Content-Length": Buffer.byteLength(body),
       },
     };
-
     const req = https.request(options, (res) => {
       let data = "";
       res.on("data", (chunk) => { data += chunk; });
       res.on("end", () => resolve(data));
     });
-
     req.on("error", reject);
     req.write(body);
     req.end();
@@ -355,24 +620,38 @@ function postToSlack(channel, text, threadTs) {
 function isRoleplayRequest(message) {
   const lower = message.toLowerCase();
   return (
-    lower.includes("roleplay") ||
-    lower.includes("role play") ||
-    lower.includes("voice mode") ||
-    lower.includes("voice roleplay") ||
-    lower.includes("practice call") ||
-    lower.includes("mock call") ||
-    lower.includes("simulate") ||
-    lower.includes("simulation")
+    lower.includes("roleplay") || lower.includes("role play") ||
+    lower.includes("voice mode") || lower.includes("practice call") ||
+    lower.includes("mock call") || lower.includes("simulate")
   );
+}
+
+// ── Detect rep name from message context ──
+function extractRepName(message, threadHistory) {
+  // Look for "rep name: X" or "this is X's call" patterns
+  const patterns = [
+    /rep(?:\s+name)?[:\s]+([A-Z][a-z]+)/i,
+    /this is ([A-Z][a-z]+)'s call/i,
+    /([A-Z][a-z]+)'s performance review/i,
+    /review for ([A-Z][a-z]+)/i,
+  ];
+  for (const p of patterns) {
+    const m = message.match(p);
+    if (m) return m[1];
+  }
+  // Check thread history for a name
+  for (const msg of threadHistory) {
+    for (const p of patterns) {
+      const m = msg.content?.match(p);
+      if (m) return m[1];
+    }
+  }
+  return "Unknown";
 }
 
 app.post("/slack/events", async (req, res) => {
   const body = req.body;
-
-  if (body.type === "url_verification") {
-    return res.json({ challenge: body.challenge });
-  }
-
+  if (body.type === "url_verification") return res.json({ challenge: body.challenge });
   res.sendStatus(200);
 
   const event = body.event;
@@ -381,7 +660,6 @@ app.post("/slack/events", async (req, res) => {
 
   const isAppMention = event.type === "app_mention";
   const isThreadReply = event.type === "message" && event.thread_ts && event.thread_ts !== event.ts;
-
   if (!isAppMention && !isThreadReply) return;
 
   const eventId = body.event_id;
@@ -392,16 +670,24 @@ app.post("/slack/events", async (req, res) => {
   const channel = event.channel;
   const threadTs = event.thread_ts || event.ts;
   const userMessage = event.text?.replace(/<@[^>]+>/g, "").trim();
-
   if (!userMessage) return;
 
   // ── Roleplay trigger ──
   if (isRoleplayRequest(userMessage)) {
-    await postToSlack(
-      channel,
+    await postToSlack(channel,
       `🎙 *Voice Roleplay Mode*\n\nOpen the link below to run a live call simulation with SetryX AI. Speak naturally — SetryX plays the prospect. When you end the call you'll get a full 19-metric Performance Review posted here in Slack.\n\n👉 ${VOICE_ROLEPLAY_URL}\n\n_Allow microphone access when prompted. Best used in Chrome._`,
-      threadTs
-    );
+      threadTs);
+    return;
+  }
+
+  // ── Manager analytics trigger ──
+  if (isManagerQuery(userMessage)) {
+    try {
+      await handleManagerQuery(userMessage, channel, threadTs);
+    } catch (err) {
+      console.error("Manager query error:", err.message);
+      await postToSlack(channel, `Error pulling analytics: ${err.message}`, threadTs);
+    }
     return;
   }
 
@@ -431,10 +717,30 @@ app.post("/slack/events", async (req, res) => {
   try {
     const reply = await callClaude(threadHistory[threadTs]);
     threadHistory[threadTs].push({ role: "assistant", content: reply });
-    if (threadHistory[threadTs].length > 20) {
-      threadHistory[threadTs] = threadHistory[threadTs].slice(-20);
-    }
+    if (threadHistory[threadTs].length > 20) threadHistory[threadTs] = threadHistory[threadTs].slice(-20);
+
     await postToSlack(channel, reply, threadTs);
+
+    // ── Auto-save reviews to database ──
+    const lowerReply = reply.toLowerCase();
+    const lowerMsg = userMessage.toLowerCase();
+
+    if (reply.includes("OVERALL CALL SCORE:")) {
+      const repName = extractRepName(userMessage, threadHistory[threadTs]);
+      let reviewData;
+
+      if (lowerMsg.includes("performance review") || reply.includes("Framework Flow")) {
+        reviewData = parsePerformanceReview(reply, repName);
+      } else if (lowerMsg.includes("deal review") || reply.includes("Close Probability")) {
+        reviewData = parseDealReview(reply, repName);
+      }
+
+      if (reviewData) {
+        reviewData.channel = channel;
+        await saveReview(reviewData);
+      }
+    }
+
   } catch (err) {
     console.error("Error:", err.message);
     await postToSlack(channel, "Something went wrong: " + err.message, threadTs);
@@ -444,4 +750,9 @@ app.post("/slack/events", async (req, res) => {
 app.get("/", (req, res) => res.send("SetryX AI is running."));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`SetryX AI running on port ${PORT}`));
+setupDatabase().then(() => {
+  app.listen(PORT, () => console.log(`SetryX AI running on port ${PORT}`));
+}).catch(err => {
+  console.error("Database setup failed:", err.message);
+  app.listen(PORT, () => console.log(`SetryX AI running (no DB) on port ${PORT}`));
+});
