@@ -5,6 +5,8 @@ app.use(express.json());
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
+const AIRCALL_API_ID = process.env.AIRCALL_API_ID;
+const AIRCALL_API_TOKEN = process.env.AIRCALL_API_TOKEN;
 
 const VOICE_ROLEPLAY_URL = "https://setryx-voice.up.railway.app";
 
@@ -190,6 +192,61 @@ NEVER end any output without the Overall Call Score block.
 BEHAVIOR ENFORCEMENT:
 Never generate generic summaries. Only the clarification question or the exact requested format. No fluff. No invented details.`;
 
+// ── Aircall API ──
+function fetchAircallTranscript(callId) {
+  return new Promise((resolve, reject) => {
+    const auth = Buffer.from(`${AIRCALL_API_ID}:${AIRCALL_API_TOKEN}`).toString("base64");
+    const options = {
+      hostname: "api.aircall.io",
+      path: `/v1/calls/${callId}`,
+      method: "GET",
+      headers: {
+        "Authorization": `Basic ${auth}`,
+        "Content-Type": "application/json",
+      },
+    };
+
+    const req = https.request(options, (res) => {
+      let data = "";
+      res.on("data", (chunk) => { data += chunk; });
+      res.on("end", () => {
+        try {
+          const parsed = JSON.parse(data);
+          const call = parsed.call;
+          if (!call) return reject(new Error("Call not found"));
+
+          // Try to get transcript from transcription object
+          let transcript = null;
+          if (call.transcription && call.transcription.content) {
+            transcript = call.transcription.content;
+          } else if (call.transcript) {
+            transcript = call.transcript;
+          }
+
+          if (!transcript) return reject(new Error("No transcript found for this call. Make sure AI transcription is enabled and the call has been processed."));
+
+          const duration = call.duration ? `${Math.floor(call.duration / 60)}:${String(call.duration % 60).padStart(2, "0")}` : "Unknown";
+          resolve({ transcript, duration, callId });
+        } catch (e) {
+          reject(new Error("Failed to parse Aircall response"));
+        }
+      });
+    });
+
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+// ── Extract Aircall call ID from URL ──
+function extractAircallCallId(text) {
+  // Match patterns like:
+  // https://dashboard.aircall.io/calls/12345678
+  // https://app.aircall.io/calls/12345678
+  const match = text.match(/aircall\.io\/(?:calls|call)\/(\d+)/i);
+  return match ? match[1] : null;
+}
+
 function callClaude(messages) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({
@@ -311,6 +368,27 @@ app.post("/slack/events", async (req, res) => {
       `🎙 *Voice Roleplay Mode*\n\nOpen the link below to run a live call simulation with SetryX AI. Speak naturally — SetryX plays the prospect. When you end the call you'll get a full 19-metric Performance Review posted here in Slack.\n\n👉 ${VOICE_ROLEPLAY_URL}\n\n_Allow microphone access when prompted. Best used in Chrome._`,
       threadTs
     );
+    return;
+  }
+
+  // ── Aircall URL trigger ──
+  const aircallCallId = extractAircallCallId(userMessage);
+  if (aircallCallId) {
+    await postToSlack(channel, `⏳ Pulling transcript from Aircall...`, threadTs);
+    try {
+      const { transcript, duration } = await fetchAircallTranscript(aircallCallId);
+      await postToSlack(channel, `✅ Got it — call duration: *${duration}*. Do you want a Deal Review, a Closer Brief for the closer, or a Performance Review?`, threadTs);
+
+      // Store transcript in thread history for next message
+      if (!threadHistory[threadTs]) threadHistory[threadTs] = [];
+      threadHistory[threadTs].push({
+        role: "user",
+        content: `Here is the full call transcript pulled from Aircall (call ID: ${aircallCallId}, duration: ${duration}):\n\n${transcript}`
+      });
+    } catch (err) {
+      console.error("Aircall error:", err.message);
+      await postToSlack(channel, `❌ Couldn't pull the transcript: ${err.message}`, threadTs);
+    }
     return;
   }
 
