@@ -196,9 +196,34 @@ Never generate generic summaries. Only the clarification question or the exact r
 function fetchAircallTranscript(callId) {
   return new Promise((resolve, reject) => {
     const auth = Buffer.from(`${AIRCALL_API_ID}:${AIRCALL_API_TOKEN}`).toString("base64");
+
+    // Step 1: get call duration from standard API
+    const getDuration = () => new Promise((res2) => {
+      const opts = {
+        hostname: "api.aircall.io",
+        path: `/v1/calls/${callId}`,
+        method: "GET",
+        headers: { "Authorization": `Basic ${auth}`, "Content-Type": "application/json" },
+      };
+      const r = https.request(opts, (response) => {
+        let d = "";
+        response.on("data", c => d += c);
+        response.on("end", () => {
+          try {
+            const p = JSON.parse(d);
+            const dur = p.call?.duration;
+            res2(dur ? `${Math.floor(dur/60)}:${String(dur%60).padStart(2,"0")}` : "Unknown");
+          } catch { res2("Unknown"); }
+        });
+      });
+      r.on("error", () => res2("Unknown"));
+      r.end();
+    });
+
+    // Step 2: get transcript from Conversation Intelligence endpoint
     const options = {
       hostname: "api.aircall.io",
-      path: `/v1/calls/${callId}`,
+      path: `/v1/calls/${callId}/transcription`,
       method: "GET",
       headers: {
         "Authorization": `Basic ${auth}`,
@@ -209,49 +234,39 @@ function fetchAircallTranscript(callId) {
     const req = https.request(options, (res) => {
       let data = "";
       res.on("data", (chunk) => { data += chunk; });
-      res.on("end", () => {
+      res.on("end", async () => {
         try {
+          console.log("Transcription raw:", data.substring(0, 500));
           const parsed = JSON.parse(data);
-          console.log("Aircall raw response keys:", JSON.stringify(Object.keys(parsed)));
-          const call = parsed.call;
-          if (!call) return reject(new Error("Call not found in Aircall response"));
-
-          console.log("Call keys:", JSON.stringify(Object.keys(call)));
-          console.log("transcription field:", JSON.stringify(call.transcription)?.substring(0, 300));
-
-          // Extract transcript — try all known field structures
           let transcript = null;
 
-          if (call.transcription) {
-            const t = call.transcription;
-            console.log("transcription keys:", JSON.stringify(Object.keys(t)));
-            if (t.content) transcript = t.content;
-            else if (t.full_transcript) transcript = t.full_transcript;
+          if (parsed.transcription) {
+            const t = parsed.transcription;
+            if (typeof t === "string") transcript = t;
+            else if (t.content) transcript = t.content;
             else if (t.text) transcript = t.text;
             else if (Array.isArray(t.sentences)) {
-              transcript = t.sentences.map(s => `${s.speaker || ''}: ${s.text || s.content || ''}`).join("\n");
+              transcript = t.sentences.map(s => `${s.channel || s.speaker || ""}: ${s.text || s.content || ""}`).join("\n");
             } else if (Array.isArray(t)) {
-              transcript = t.map(s => `${s.speaker || ''}: ${s.text || s.content || ''}`).join("\n");
-            } else {
-              // Dump whatever we have
-              transcript = JSON.stringify(t);
+              transcript = t.map(s => `${s.channel || s.speaker || ""}: ${s.text || s.content || ""}`).join("\n");
             }
-          } else if (call.transcript) {
-            transcript = typeof call.transcript === "string" ? call.transcript : JSON.stringify(call.transcript);
+          } else if (parsed.sentences) {
+            transcript = parsed.sentences.map(s => `${s.channel || s.speaker || ""}: ${s.text || s.content || ""}`).join("\n");
+          } else if (parsed.content) {
+            transcript = parsed.content;
+          } else if (parsed.text) {
+            transcript = parsed.text;
           }
 
           if (!transcript) {
-            return reject(new Error(`No transcript found. Call keys available: ${Object.keys(call).join(", ")}`));
+            return reject(new Error("Transcript not available. The call may still be processing — try again in a few minutes, or make sure AI Assist is enabled on this number in Aircall."));
           }
 
-          const duration = call.duration
-            ? `${Math.floor(call.duration / 60)}:${String(call.duration % 60).padStart(2, "0")}`
-            : "Unknown";
-
+          const duration = await getDuration();
           resolve({ transcript, duration, callId });
         } catch (e) {
           console.error("Parse error:", e.message, "Raw:", data.substring(0, 500));
-          reject(new Error("Failed to parse Aircall response: " + e.message));
+          reject(new Error("Failed to parse transcript: " + e.message));
         }
       });
     });
