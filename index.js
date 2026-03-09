@@ -697,12 +697,42 @@ app.post("/slack/events", async (req, res) => {
     await postToSlack(channel, `⏳ Pulling transcript from Aircall...`, threadTs);
     try {
       const { transcript, duration } = await fetchAircallTranscript(aircallCallId);
-      await postToSlack(channel, `✅ Got it — call duration: *${duration}*. Do you want a Deal Review, a Closer Brief for the closer, or a Performance Review?`, threadTs);
+
+      // Check if review type was specified in the same message
+      const lowerMsg = userMessage.toLowerCase();
+      const wantsPerformance = lowerMsg.includes("performance review") || lowerMsg.includes("performance");
+      const wantsDeal = lowerMsg.includes("deal review") || lowerMsg.includes("deal");
+      const wantsCloserBrief = lowerMsg.includes("closer brief") || lowerMsg.includes("closer");
+
       if (!threadHistory[threadTs]) threadHistory[threadTs] = [];
       threadHistory[threadTs].push({
         role: "user",
         content: `Here is the full call transcript pulled from Aircall (call ID: ${aircallCallId}, duration: ${duration}):\n\n${transcript}`
       });
+
+      if (wantsPerformance || wantsDeal || wantsCloserBrief) {
+        // Generate review immediately
+        const reviewType = wantsPerformance ? "Performance Review" : wantsDeal ? "Deal Review" : "Closer Brief";
+        threadHistory[threadTs].push({ role: "user", content: reviewType });
+        const reply = await callClaude(threadHistory[threadTs]);
+        threadHistory[threadTs].push({ role: "assistant", content: reply });
+        await postToSlack(channel, reply, threadTs);
+
+        // Save to database
+        if (reply.includes("OVERALL CALL SCORE:")) {
+          const repName = extractRepName(userMessage, threadHistory[threadTs]);
+          let reviewData;
+          if (wantsPerformance) reviewData = parsePerformanceReview(reply, repName);
+          else if (wantsDeal) reviewData = parseDealReview(reply, repName);
+          if (reviewData) {
+            reviewData.channel = channel;
+            reviewData.call_duration = duration;
+            await saveReview(reviewData);
+          }
+        }
+      } else {
+        await postToSlack(channel, `✅ Got it — call duration: *${duration}*. Do you want a Deal Review, a Closer Brief for the closer, or a Performance Review?`, threadTs);
+      }
     } catch (err) {
       console.error("Aircall error:", err.message);
       await postToSlack(channel, `❌ Couldn't pull the transcript: ${err.message}`, threadTs);
