@@ -292,7 +292,7 @@ function fetchAircallTranscript(callId) {
   return new Promise((resolve, reject) => {
     const auth = Buffer.from(`${AIRCALL_API_ID}:${AIRCALL_API_TOKEN}`).toString("base64");
 
-    const getDuration = () => new Promise((res2) => {
+    const getCallMeta = () => new Promise((res2) => {
       const opts = {
         hostname: "api.aircall.io",
         path: `/v1/calls/${callId}`,
@@ -305,12 +305,16 @@ function fetchAircallTranscript(callId) {
         response.on("end", () => {
           try {
             const p = JSON.parse(d);
-            const dur = p.call?.duration;
-            res2(dur ? `${Math.floor(dur/60)}:${String(dur%60).padStart(2,"0")}` : "Unknown");
-          } catch { res2("Unknown"); }
+            const call = p.call;
+            const dur = call?.duration;
+            const duration = dur ? `${Math.floor(dur/60)}:${String(dur%60).padStart(2,"0")}` : "Unknown";
+            // Try to get rep name from user field
+            const repName = call?.user?.name || call?.user?.email?.split("@")[0] || "Unknown";
+            res2({ duration, repName });
+          } catch { res2({ duration: "Unknown", repName: "Unknown" }); }
         });
       });
-      r.on("error", () => res2("Unknown"));
+      r.on("error", () => res2({ duration: "Unknown", repName: "Unknown" }));
       r.end();
     });
 
@@ -352,8 +356,8 @@ function fetchAircallTranscript(callId) {
             return reject(new Error("Transcript not available. The call may still be processing — try again in a few minutes, or make sure AI Assist is enabled on this number in Aircall."));
           }
 
-          const duration = await getDuration();
-          resolve({ transcript, duration, callId });
+          const { duration, repName: aircallRepName } = await getCallMeta();
+          resolve({ transcript, duration, repName: aircallRepName, callId });
         } catch (e) {
           reject(new Error("Failed to parse transcript: " + e.message));
         }
@@ -696,7 +700,7 @@ app.post("/slack/events", async (req, res) => {
   if (aircallCallId) {
     await postToSlack(channel, `⏳ Pulling transcript from Aircall...`, threadTs);
     try {
-      const { transcript, duration } = await fetchAircallTranscript(aircallCallId);
+      const { transcript, duration, repName: aircallRepName } = await fetchAircallTranscript(aircallCallId);
 
       // Check if review type was specified in the same message
       const lowerMsg = userMessage.toLowerCase();
@@ -707,23 +711,21 @@ app.post("/slack/events", async (req, res) => {
       if (!threadHistory[threadTs]) threadHistory[threadTs] = [];
       threadHistory[threadTs].push({
         role: "user",
-        content: `Here is the full call transcript pulled from Aircall (call ID: ${aircallCallId}, duration: ${duration}):\n\n${transcript}`
+        content: `Here is the full call transcript pulled from Aircall (call ID: ${aircallCallId}, duration: ${duration}, rep: ${aircallRepName}):\n\n${transcript}`
       });
 
       if (wantsPerformance || wantsDeal || wantsCloserBrief) {
-        // Generate review immediately
         const reviewType = wantsPerformance ? "Performance Review" : wantsDeal ? "Deal Review" : "Closer Brief";
         threadHistory[threadTs].push({ role: "user", content: reviewType });
         const reply = await callClaude(threadHistory[threadTs]);
         threadHistory[threadTs].push({ role: "assistant", content: reply });
         await postToSlack(channel, reply, threadTs);
 
-        // Save to database
+        // Save to database with rep name from Aircall
         if (reply.includes("OVERALL CALL SCORE:")) {
-          const repName = extractRepName(userMessage, threadHistory[threadTs]);
           let reviewData;
-          if (wantsPerformance) reviewData = parsePerformanceReview(reply, repName);
-          else if (wantsDeal) reviewData = parseDealReview(reply, repName);
+          if (wantsPerformance) reviewData = parsePerformanceReview(reply, aircallRepName);
+          else if (wantsDeal) reviewData = parseDealReview(reply, aircallRepName);
           if (reviewData) {
             reviewData.channel = channel;
             reviewData.call_duration = duration;
@@ -731,7 +733,7 @@ app.post("/slack/events", async (req, res) => {
           }
         }
       } else {
-        await postToSlack(channel, `✅ Got it — call duration: *${duration}*. Do you want a Deal Review, a Closer Brief for the closer, or a Performance Review?`, threadTs);
+        await postToSlack(channel, `✅ Got it — call by *${aircallRepName}*, duration: *${duration}*. Do you want a Deal Review, a Closer Brief for the closer, or a Performance Review?`, threadTs);
       }
     } catch (err) {
       console.error("Aircall error:", err.message);
