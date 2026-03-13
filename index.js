@@ -334,26 +334,55 @@ function fetchAircallTranscript(callId) {
           const parsed = JSON.parse(data);
           let transcript = null;
 
+          // Log full structure so we can debug if needed
+          console.log("Transcription parsed keys:", Object.keys(parsed));
+
+          // Helper: extract text from a sentence object regardless of field name
+          const sentenceToText = (s) => {
+            if (typeof s === "string") return s;
+            const text = s.text || s.content || s.transcript || s.body || s.message || "";
+            const speaker = s.channel || s.speaker || s.author || s.name || "";
+            return speaker ? `${speaker}: ${text}` : text;
+          };
+
+          // Helper: join an array of sentences
+          const joinSentences = (arr) => arr.map(sentenceToText).filter(Boolean).join("\n");
+
           if (parsed.transcription) {
             const t = parsed.transcription;
+            console.log("transcription type:", typeof t, Array.isArray(t) ? "array" : "");
             if (typeof t === "string") transcript = t;
-            else if (t.content) transcript = t.content;
-            else if (t.text) transcript = t.text;
-            else if (Array.isArray(t.sentences)) {
-              transcript = t.sentences.map(s => `${s.channel || s.speaker || ""}: ${s.text || s.content || ""}`).join("\n");
-            } else if (Array.isArray(t)) {
-              transcript = t.map(s => `${s.channel || s.speaker || ""}: ${s.text || s.content || ""}`).join("\n");
+            else if (t.content && typeof t.content === "string") transcript = t.content;
+            else if (t.text && typeof t.text === "string") transcript = t.text;
+            else if (t.full_transcript) transcript = t.full_transcript;
+            else if (Array.isArray(t.sentences)) transcript = joinSentences(t.sentences);
+            else if (Array.isArray(t.utterances)) transcript = joinSentences(t.utterances);
+            else if (Array.isArray(t)) transcript = joinSentences(t);
+            else {
+              // Last resort: dump entire object as string so bot at least has something
+              console.log("Unknown transcription structure:", JSON.stringify(t).substring(0, 300));
+              transcript = JSON.stringify(t);
             }
           } else if (parsed.sentences) {
-            transcript = parsed.sentences.map(s => `${s.channel || s.speaker || ""}: ${s.text || s.content || ""}`).join("\n");
+            transcript = joinSentences(parsed.sentences);
+          } else if (parsed.utterances) {
+            transcript = joinSentences(parsed.utterances);
           } else if (parsed.content) {
             transcript = parsed.content;
           } else if (parsed.text) {
             transcript = parsed.text;
+          } else if (parsed.full_transcript) {
+            transcript = parsed.full_transcript;
           }
 
           if (!transcript) {
             return reject(new Error("Transcript not available. The call may still be processing — try again in a few minutes, or make sure AI Assist is enabled on this number in Aircall."));
+          }
+
+          // Force to string — never pass an object downstream
+          if (typeof transcript !== "string") {
+            console.log("Transcript was not a string, type:", typeof transcript, "— converting");
+            transcript = JSON.stringify(transcript);
           }
 
           const { duration, repName: aircallRepName } = await getCallMeta();
