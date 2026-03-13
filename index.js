@@ -528,6 +528,14 @@ Score 19 metrics 1-5:
 
 SCORING SCALE: 1=absent/damaging. 2=weak. 3=solid but improvable. 4=strong, minor gaps. 5=exemplary — earned.
 
+CRITICAL SCORING RULES (NON-NEGOTIABLE):
+- You may ONLY score a metric below 3 if you can point to a specific moment in the transcript that proves it was weak or missing. No moment = no low score.
+- You may ONLY score a metric above 3 if you can point to a specific moment in the transcript that proves it was strong. No moment = no high score.
+- Default is 3/5 for any metric where the transcript provides insufficient evidence either way.
+- NEVER invent dialogue, quotes, or moments that do not appear in the transcript. If you reference something the rep or prospect said, it must be word-for-word from the transcript provided.
+- Score only what actually happened. Do not penalise for things the setter didn't need to do (e.g. handling objections when there were none).
+- The Notes section (Standard You're Missing, The One Thing, Fix These Now) must also reference real transcript moments. If you cannot quote or paraphrase a specific moment, do not include it as evidence.
+
 Show full 19-point scorecard first, then deliver:
 
 ====================
@@ -552,7 +560,7 @@ OVERALL CALL SCORE: X/10
 NEVER end any output without the Overall Call Score block.
 
 BEHAVIOR ENFORCEMENT:
-Never generate generic summaries. Only the clarification question or the exact requested format. No fluff. No invented details.`;
+Never generate generic summaries. Only the clarification question or the exact requested format. No fluff. No invented details. Never reference dialogue, quotes, or events that do not appear verbatim in the transcript. If you catch yourself about to write something the prospect or setter said that isn't in the transcript — stop and delete it.`;
 
 function callClaude(messages) {
   return callClaudeWithSystem(SYSTEM_PROMPT, messages);
